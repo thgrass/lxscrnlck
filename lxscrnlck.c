@@ -1,6 +1,11 @@
 /*
   Compile with:
 gcc `pkg-config --cflags gtk+-3.0 lxpanel cairo` -shared -fPIC lxscrnlck.c -o lxscrnlck.so `pkg-config --libs gtk+-3.0 lxpanel cairo` -lXext -lX11
+
+  Install with:
+Move the compiled .so file to the LXPanel plugins directory, typically /usr/lib/arm-linux-gnueabihf/lxpanel/plugins/ or /usr/lib/aarch64-linux-gnu/lxpanel/plugins/, but the exact path may vary.
+Restart LXPanel with lxpanelctl restart.
+Add the plugin to the panel using the LXPanel configuration UI.
 */
 
 #include <lxpanel/plugin.h>
@@ -8,111 +13,43 @@ gcc `pkg-config --cflags gtk+-3.0 lxpanel cairo` -shared -fPIC lxscrnlck.c -o lx
 #include <X11/Xlib.h>
 #include <X11/extensions/dpms.h>
 #include <cairo.h>
+#include <gdk-pixbuf/gdk-pixbuf.h>
 
-static void update_icon(GtkWidget *button);
-
-// Draw the icon with Cairo based on DPMS state
-static void draw_icon(cairo_t *cr, gboolean dpmsEnabled) {
-    cairo_set_line_width(cr, 2);
-    if (dpmsEnabled) {
-        // Drawing a simple "enabled" icon - a green circle
-        cairo_set_source_rgb(cr, 0, 1, 0);
-        cairo_arc(cr, 16, 16, 15, 0, 2 * G_PI);
-        cairo_fill(cr);
-    } else {
-        // Drawing a simple "disabled" icon - a red circle
-        cairo_set_source_rgb(cr, 1, 0, 0);
-        cairo_arc(cr, 16, 16, 15, 0, 2 * G_PI);
-        cairo_fill(cr);
-    }
-}
-
-// Create an icon as a GdkPixbuf
-static GdkPixbuf *create_icon(gboolean dpmsEnabled) {
-    cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 32, 32);
-    cairo_t *cr = cairo_create(surface);
-
-    draw_icon(cr, dpmsEnabled);
-
-    GdkPixbuf *pixbuf = gdk_pixbuf_get_from_surface(surface, 0, 0, 32, 32);
-
-    cairo_destroy(cr);
-    cairo_surface_destroy(surface);
-
-    return pixbuf;
-}
-
-// Update the icon on the button to reflect the current DPMS state
-static void update_icon(GtkWidget *button) {
-    Display *display = XOpenDisplay(NULL);
-    if (!display) {
-        g_warning("Unable to open display");
-        return;
-    }
-
-    BOOL dpmsEnabled;
-    CARD16 powerLevel;
-    DPMSInfo(display, &powerLevel, &dpmsEnabled);
-
-    GdkPixbuf *pixbuf = create_icon(dpmsEnabled);
-    GtkWidget *image = gtk_image_new_from_pixbuf(pixbuf);
-    gtk_button_set_image(GTK_BUTTON(button), image);
-
-    g_object_unref(pixbuf); // Cleanup
-    XCloseDisplay(display);
-}
+static Display *disp;
 
 // Toggle DPMS/screen blanking state
 static void toggle_dpms(GtkWidget *widget, gpointer data) {
-    Display *display = XOpenDisplay(NULL);
-    if (!display) {
-        g_warning("Unable to open display");
-        return;
-    }
-
     BOOL dpmsEnabled;
     CARD16 powerLevel;
-    DPMSInfo(display, &powerLevel, &dpmsEnabled);
+    DPMSInfo(disp, &powerLevel, &dpmsEnabled);
 
     if (dpmsEnabled) {
-        DPMSDisable(display);
+        DPMSDisable(disp);
     } else {
-        DPMSEnable(display);
+        DPMSEnable(disp);
     }
 
-    XFlush(display);
-    XCloseDisplay(display);
-
-    update_icon(widget); // Update the icon based on the new DPMS state
+    XFlush(disp);
 }
 
-// Lock the screen immediately
+// Handler for the screen lock command
 static void lock_screen(GtkWidget *widget, gpointer data) {
     system("dm-tool lock");
 }
 
 // Set DPMS state from menu selection
 static void set_dpms_state(GtkWidget *widget, gpointer data) {
-    Display *display = XOpenDisplay(NULL);
-    if (!display) {
-        g_warning("Unable to open display");
-        return;
-    }
-
     if (GPOINTER_TO_INT(data)) {
-        DPMSEnable(display);
+        DPMSEnable(disp);
     } else {
-        DPMSDisable(display);
+        DPMSDisable(disp);
     }
 
-    XFlush(display);
-    XCloseDisplay(display);
-
-    update_icon(GTK_WIDGET(gtk_widget_get_parent(gtk_widget_get_parent(widget))));
+    XFlush(disp);
 }
 
 // Create and show the right-click menu
-static void create_menu(GtkWidget *button) {
+static void show_menu(GtkWidget *widget, GdkEventButton *event) {
     GtkWidget *menu = gtk_menu_new();
     GtkWidget *enableItem = gtk_menu_item_new_with_label("Enable Screen Blanking");
     GtkWidget *disableItem = gtk_menu_item_new_with_label("Disable Screen Blanking");
@@ -127,40 +64,43 @@ static void create_menu(GtkWidget *button) {
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), lockItem);
 
     gtk_widget_show_all(menu);
-    gtk_menu_popup_at_widget(GTK_MENU(menu), button, GDK_GRAVITY_SOUTH, GDK_GRAVITY_NORTH, NULL);
+
+    gtk_menu_popup(GTK_MENU(menu), NULL, NULL, NULL, NULL, event->button, event->time);
 }
 
-// Handler for right-click events on the button
-static gboolean button_event(GtkWidget *widget, GdkEventButton *event, gpointer data) {
-    if (event->type == GDK_BUTTON_PRESS && event->button == 3) { // Right-click
-        create_menu(widget);
-        return TRUE; // Event handled
+// Plugin button clicked callback
+static gboolean button_clicked(GtkWidget *widget, GdkEventButton *event, gpointer user_data) {
+    if (event->type == GDK_BUTTON_PRESS && event->button == 3) {
+        show_menu(widget, event);
+        return TRUE;
+    } else if (event->type == GDK_BUTTON_PRESS && event->button == 1) {
+        toggle_dpms(widget, NULL);
+        return TRUE;
     }
-    return FALSE; // Event not handled, pass it on
+    return FALSE;
 }
 
-// Constructor for the plugin, setting up the button and its signals
-static GtkWidget *constructor(LXPanel *panel, config_setting_t *settings) {
-    // Create a new button without any label
-    GtkWidget *button = gtk_button_new();
-    update_icon(button); // Set the initial icon based on the current DPMS state
+// Plugin constructor
+static GtkWidget *construct_plugin_widget(LXPanel *panel, config_setting_t *settings) {
+    disp = XOpenDisplay(NULL);
+    if (!disp) {
+        g_warning("Unable to open display");
+        return NULL;
+    }
 
-    // Connect signals for left-click to toggle DPMS and right-click to show menu
-    g_signal_connect(G_OBJECT(button), "clicked", G_CALLBACK(toggle_dpms), NULL);
-    g_signal_connect(G_OBJECT(button), "button-press-event", G_CALLBACK(button_event), NULL);
+    GtkWidget *button = gtk_button_new_with_label("Screen Lock Control");
+    g_signal_connect(G_OBJECT(button), "button-press-event", G_CALLBACK(button_clicked), NULL);
 
-    // This makes the button as small as possible
-    gtk_button_set_relief(GTK_BUTTON(button), GTK_RELIEF_NONE);
-    gtk_container_set_border_width(GTK_CONTAINER(button), 0);
+    gtk_container_add(GTK_CONTAINER(panel), button);
+    gtk_widget_show_all(button);
 
     return button;
 }
 
-// Plugin descriptor
-FM_DEFINE_MODULE(lxpanel_gtk, myplugin)
+// Plugin initialization
+FM_DEFINE_MODULE(lxpanel_gtk, screen_control)
 
-// Initialization function for the plugin
-void fm_module_init(LXPanel *panel, const FmModuleInitData *init_data) {
-    // Register the plugin, providing the name and the constructor function
-    lxpanel_plugin_register(init_data->name, constructor, NULL);
+// Module entry
+void fm_module_init(LXPanel *panel, config_setting_t *settings) {
+    lxpanel_plugin_add_common(panel, settings, "lxscrnlck", construct_plugin_widget);
 }
